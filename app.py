@@ -22,6 +22,9 @@ TIME_PREFERENCES = {
     'evening': '19:00'
 }
 
+# Add weekday names constant
+WEEKDAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+
 # Initialize Flask and logging
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -60,8 +63,12 @@ def calculate_next_occurrence(reminder_time, recurrence_type, recurrence_pattern
     time_of_day = TIME_PREFERENCES[time_preference]
     hour, minute = map(int, time_of_day.split(':'))
     
+    # Ensure we don't create past reminders
+    next_date = base_time
+    if next_date.hour > hour or (next_date.hour == hour and next_date.minute >= minute):
+        next_date += timedelta(days=1)
+    
     if recurrence_type == 'daily':
-        next_date = base_time + timedelta(days=1)
         return next_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
         
     elif recurrence_type == 'weekly':
@@ -76,25 +83,72 @@ def calculate_next_occurrence(reminder_time, recurrence_type, recurrence_pattern
         weekday = pattern.get('weekday', 0)
         week_numbers = pattern.get('week_numbers', [1])
         
-        # Get next month's dates
-        next_month = base_time.replace(day=1) + timedelta(days=32)
-        next_month = next_month.replace(day=1)
+        # Start from current month
+        current_month = base_time.replace(day=1, hour=hour, minute=minute, second=0, microsecond=0)
         
-        # Find all occurrences of the weekday
-        weekday_dates = []
-        current = next_month
-        while current.month == next_month.month:
-            if current.weekday() == weekday:
-                week_num = (current.day - 1) // 7 + 1
-                if week_num in week_numbers or (-1 in week_numbers and current.month != (current + timedelta(days=7)).month):
-                    weekday_dates.append(current)
-            current += timedelta(days=1)
+        while True:
+            # Get all weekday occurrences in current month
+            weekday_dates = []
+            current = current_month
+            while current.month == current_month.month:
+                if current.weekday() == weekday:
+                    week_num = (current.day - 1) // 7 + 1
+                    if week_num in week_numbers or (-1 in week_numbers and current.month != (current + timedelta(days=7)).month):
+                        weekday_dates.append(current)
+                current += timedelta(days=1)
             
-        if weekday_dates:
-            next_date = min(weekday_dates)
-            return next_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            # Find first occurrence after base_time
+            future_dates = [d for d in weekday_dates if d > base_time]
+            if future_dates:
+                return min(future_dates)
+                
+            # Move to next month if no valid dates found
+            current_month = (current_month + timedelta(days=32)).replace(day=1)
             
     return None
+
+def process_reminder(reminder, conn):
+    """Process a single reminder with proper error handling"""
+    try:
+        logger.info(f"Processing reminder {reminder.id} for user {reminder.user_id}")
+        
+        # Calculate next occurrence first
+        next_time = None
+        if reminder.recurrence_type != 'none':
+            next_time = calculate_next_occurrence(
+                reminder.reminder_time,
+                reminder.recurrence_type,
+                reminder.recurrence_pattern,
+                reminder.time_preference
+            )
+        
+        # Update reminder status
+        update_values = {'status': 'completed'}
+        if next_time:
+            update_values.update({
+                'reminder_time': next_time,
+                'next_occurrence': next_time,
+                'status': 'pending'
+            })
+            
+        conn.execute(
+            reminders.update()
+            .where(reminders.c.id == reminder.id)
+            .values(**update_values)
+        )
+        conn.commit()
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error processing reminder {reminder.id}: {e}")
+        # Mark as failed instead of leaving in processing state
+        conn.execute(
+            reminders.update()
+            .where(reminders.c.id == reminder.id)
+            .values(status='failed')
+        )
+        conn.commit()
+        return False
 
 def check_reminders():
     """Background thread to check and trigger reminders"""
@@ -102,8 +156,9 @@ def check_reminders():
         try:
             with engine.connect() as conn:
                 now = datetime.now(timezone.utc)
+                # Add processing status to prevent duplicate processing
                 query = select(reminders).where(
-                    reminders.c.status == 'pending',
+                    reminders.c.status.in_(['pending', 'failed']),  # Also retry failed reminders
                     reminders.c.reminder_time <= now
                 )
                 
@@ -111,38 +166,19 @@ def check_reminders():
                 due_reminders = result.fetchall()
                 
                 for reminder in due_reminders:
-                    logger.info(f"REMINDER for user {reminder.user_id}: {reminder.reminder_text}")
-                    
-                    if reminder.recurrence_type != 'none':
-                        # Calculate next occurrence for recurring reminders
-                        next_time = calculate_next_occurrence(
-                            reminder.reminder_time,
-                            reminder.recurrence_type,
-                            reminder.recurrence_pattern,
-                            reminder.time_preference
-                        )
-                        
-                        if next_time:
-                            conn.execute(
-                                reminders.update()
-                                .where(reminders.c.id == reminder.id)
-                                .values(
-                                    reminder_time=next_time,
-                                    next_occurrence=next_time
-                                )
-                            )
-                    else:
-                        # Mark one-time reminder as completed
-                        conn.execute(
-                            reminders.update()
-                            .where(reminders.c.id == reminder.id)
-                            .values(status='completed')
-                        )
-                    
+                    # Mark as processing
+                    conn.execute(
+                        reminders.update()
+                        .where(reminders.c.id == reminder.id)
+                        .values(status='processing')
+                    )
                     conn.commit()
                     
+                    # Process reminder
+                    process_reminder(reminder, conn)
+                    
         except Exception as e:
-            logger.error(f"Error checking reminders: {e}")
+            logger.error(f"Error in reminder check loop: {e}")
             
         time.sleep(10)
 
@@ -152,10 +188,21 @@ def index():
         if MACHINE == 'local':
             return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'index.html')
         else:
-            return send_from_directory('/home/sidharthraj/mysite/index.html', 'index.html')
+            return send_from_directory('/home/sidharthraj/mysite', 'index.html')
     except Exception as e:
         logger.error(f"Error serving index page: {e}")
         return jsonify({'error': 'Could not load the page'}), 500
+    
+@app.route('/script.js')
+def serve_script():
+    try:
+        if MACHINE == 'local':
+            return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'script.js')
+        else:
+            return send_from_directory('/home/sidharthraj/mysite', 'script.js')
+    except Exception as e:
+        logger.error(f"Error serving JavaScript file: {e}")
+        return jsonify({'error': 'Could not load the JavaScript file'}), 500
 
 @app.route('/set_reminder', methods=['POST'])
 def set_reminder():
@@ -219,19 +266,29 @@ def get_reminders(user_id):
             
             for row in result:
                 recurrence_info = ''
-                if row.recurrence_type != 'none':
-                    pattern = json.loads(row.recurrence_pattern)
-                    if row.recurrence_type == 'monthly_weekday':
-                        weekday_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-                        week_numbers = pattern.get('week_numbers', [])
-                        week_desc = 'Last' if -1 in week_numbers else '/'.join([str(n) + 'st' for n in week_numbers])
-                        weekday = weekday_names[pattern.get('weekday', 0)]
-                        recurrence_info = f"Every {week_desc} {weekday}"
-                    elif row.recurrence_type == 'daily':
-                        recurrence_info = 'Every day'
-                    elif row.recurrence_type == 'weekly':
-                        weekday = weekday_names[pattern.get('weekday', 0)]
-                        recurrence_info = f'Every {weekday}'
+                if row.recurrence_type != 'none' and row.recurrence_pattern:  # Check if pattern exists
+                    try:
+                        pattern = json.loads(row.recurrence_pattern)
+                        if row.recurrence_type == 'monthly_weekday':
+                            week_numbers = pattern.get('week_numbers', [])
+                            week_desc = 'Last' if -1 in week_numbers else '/'.join([str(n) + 'st' for n in week_numbers])
+                            weekday_index = pattern.get('weekday')
+                            if weekday_index is not None and 0 <= weekday_index < len(WEEKDAY_NAMES):
+                                weekday = WEEKDAY_NAMES[weekday_index]
+                                recurrence_info = f"Every {week_desc} {weekday}"
+                            else:
+                                recurrence_info = "Every month"
+                        elif row.recurrence_type == 'daily':
+                            recurrence_info = 'Every day'
+                        elif row.recurrence_type == 'weekly':
+                            weekday_index = pattern.get('weekday')
+                            if weekday_index is not None and 0 <= weekday_index < len(WEEKDAY_NAMES):
+                                weekday = WEEKDAY_NAMES[weekday_index]
+                                recurrence_info = f'Every {weekday}'
+                            else:
+                                recurrence_info = 'Every week'
+                    except json.JSONDecodeError:
+                        recurrence_info = row.recurrence_type.capitalize()
                 
                 user_reminders.append({
                     'reminder_id': row.id,
@@ -240,12 +297,30 @@ def get_reminders(user_id):
                     'status': row.status,
                     'recurrence_info': recurrence_info,
                     'time_preference': row.time_preference,
-                    'tags': json.loads(row.tags) if row.tags else []
+                    'tags': json.loads(row.tags) if row.tags and row.tags != 'null' else []
                 })
 
         return jsonify({'reminders': user_reminders})
     except Exception as e:
         logger.error(f"Error getting reminders: {e}")
+        return jsonify({'error': str(e)}), 500
+    
+@app.route('/delete_reminder/<reminder_id>', methods=['DELETE'])
+def delete_reminder(reminder_id):
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                reminders.delete().where(reminders.c.id == reminder_id)
+            )
+            conn.commit()
+            
+            if result.rowcount > 0:
+                return jsonify({'message': 'Reminder deleted successfully'})
+            else:
+                return jsonify({'error': 'Reminder not found'}), 404
+                
+    except Exception as e:
+        logger.error(f"Error deleting reminder: {e}")
         return jsonify({'error': str(e)}), 500
 
 # Start the background thread
