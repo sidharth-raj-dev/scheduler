@@ -1,8 +1,15 @@
+import sys
+import os
+
+sys.path.append(os.getcwd()+'/myenv/lib/python3.10/site-packages')
+print(os.getcwd())
+print(sys.path)
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.executors.pool import ThreadPoolExecutor
 from datetime import datetime
-import os
+
 from flask import Flask, request, jsonify
 import logging
 
@@ -45,7 +52,7 @@ def send_reminder(reminder_text, user_id):
 @app.route('/')
 def home():
     try:
-        with open('/home/sidharthraj/mysite/index.html', 'r') as file:
+        with open(os.getcwd()+'/index.html', 'r') as file:
             return file.read()
     except Exception as e:
         logger.error(f"Error serving index.html: {e}")
