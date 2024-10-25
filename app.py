@@ -1,21 +1,21 @@
 import sys
 import os
+import logging
 
 sys.path.append(os.getcwd()+'/myenv/lib/python3.10/site-packages')
-print(os.getcwd())
-print(sys.path)
+
+# set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+logger.info(os.getcwd())
+logger.info(sys.path)
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.executors.pool import ThreadPoolExecutor
 from datetime import datetime
-
 from flask import Flask, request, jsonify
-import logging
-
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -52,7 +52,7 @@ def send_reminder(reminder_text, user_id):
 @app.route('/')
 def home():
     try:
-        with open(os.getcwd()+'/index.html', 'r') as file:
+        with open(os.getcwd()+'/mysite/index.html', 'r') as file:
             return file.read()
     except Exception as e:
         logger.error(f"Error serving index.html: {e}")
@@ -63,7 +63,8 @@ def set_reminder():
     try:
         data = request.json
         reminder_text = data.get('reminder_text')
-        reminder_time = datetime.fromisoformat(data.get('reminder_time'))
+        reminder_time_str = data.get('reminder_time').rstrip('Z')  # Remove trailing Z
+        reminder_time = datetime.fromisoformat(reminder_time_str)
         user_id = data.get('user_id')
 
         if not all([reminder_text, reminder_time, user_id]):
