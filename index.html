@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Reminder System</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.1/moment.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .reminder {
+            border: 1px solid #ddd;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 4px;
+            background-color: #fff;
+        }
+        .time {
+            color: #666;
+            font-size: 0.9em;
+        }
+        .delete-btn {
+            float: right;
+            background-color: #ff4444;
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .form-container {
+            margin-top: 20px;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .input-group {
+            margin-bottom: 15px;
+        }
+        input, button {
+            padding: 8px;
+            margin: 5px 0;
+        }
+        .submit-btn {
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .error {
+            color: red;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Reminder System</h1>
+        
+        <div class="form-container">
+            <h2>Add New Reminder</h2>
+            <div class="input-group">
+                <label for="reminder_text">Reminder Text:</label><br>
+                <input type="text" id="reminder_text" name="reminder_text" required>
+            </div>
+            <div class="input-group">
+                <label for="reminder_time">Reminder Time:</label><br>
+                <input type="datetime-local" id="reminder_time" name="reminder_time" required>
+            </div>
+            <button onclick="addReminder()" class="submit-btn">Add Reminder</button>
+            <div id="error" class="error"></div>
+        </div>
+
+        <h2>Current Reminders</h2>
+        <div id="reminders"></div>
+    </div>
+
+    <script>
+        async function fetchReminders() {
+            try {
+                const response = await fetch('/get_reminders/default_user');
+                const data = await response.json();
+                displayReminders(data.reminders);
+            } catch (error) {
+                console.error('Error fetching reminders:', error);
+                document.getElementById('error').textContent = 'Error loading reminders';
+            }
+        }
+
+        function displayReminders(reminders) {
+            const container = document.getElementById('reminders');
+            container.innerHTML = '';
+            
+            if (reminders.length === 0) {
+                container.innerHTML = '<p>No reminders set.</p>';
+                return;
+            }
+
+            reminders.sort((a, b) => new Date(a.reminder_time) - new Date(b.reminder_time));
+            
+            reminders.forEach(reminder => {
+                const div = document.createElement('div');
+                div.className = 'reminder';
+                const formattedTime = moment(reminder.reminder_time).format('MMMM Do YYYY, h:mm:ss a');
+                
+                div.innerHTML = `
+                    <button onclick="deleteReminder('${reminder.job_id}')" class="delete-btn">Delete</button>
+                    <strong>${reminder.reminder_text}</strong><br>
+                    <span class="time">Time: ${formattedTime}</span>
+                `;
+                container.appendChild(div);
+            });
+        }
+
+        async function addReminder() {
+            const text = document.getElementById('reminder_text').value;
+            const time = document.getElementById('reminder_time').value;
+            const errorElement = document.getElementById('error');
+            
+            if (!text || !time) {
+                errorElement.textContent = 'Please fill in all fields';
+                return;
+            }
+
+            try {
+                const response = await fetch('/set_reminder', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        reminder_text: text,
+                        reminder_time: new Date(time).toISOString(),
+                        user_id: 'default_user'
+                    }),
+                });
+
+                if (response.ok) {
+                    document.getElementById('reminder_text').value = '';
+                    document.getElementById('reminder_time').value = '';
+                    errorElement.textContent = '';
+                    fetchReminders();
+                } else {
+                    const data = await response.json();
+                    errorElement.textContent = data.error || 'Error adding reminder';
+                }
+            } catch (error) {
+                console.error('Error adding reminder:', error);
+                errorElement.textContent = 'Error adding reminder';
+            }
+        }
+
+        async function deleteReminder(jobId) {
+            try {
+                const response = await fetch(`/delete_reminder/${jobId}`, {
+                    method: 'DELETE'
+                });
+                
+                if (response.ok) {
+                    fetchReminders();
+                } else {
+                    document.getElementById('error').textContent = 'Error deleting reminder';
+                }
+            } catch (error) {
+                console.error('Error deleting reminder:', error);
+                document.getElementById('error').textContent = 'Error deleting reminder';
+            }
+        }
+
+        // Load reminders when page loads
+        document.addEventListener('DOMContentLoaded', fetchReminders);
+    </script>
+</body>
+</html>
