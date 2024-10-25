@@ -4,83 +4,94 @@ import logging
 
 sys.path.append(os.getcwd()+'/myenv/lib/python3.10/site-packages')
 
+from flask import Flask, request, jsonify
+from sqlalchemy import create_engine, Table, Column, String, DateTime, MetaData
+from sqlalchemy.sql import select
+import threading
+import time
+from datetime import datetime, timezone
+
 # set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-logger.info(os.getcwd())
-logger.info(sys.path)
-
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-from apscheduler.executors.pool import ThreadPoolExecutor
-from datetime import datetime
-from flask import Flask, request, jsonify
-
 app = Flask(__name__)
 
-# Configure APScheduler
-jobstores = {
-    'default': SQLAlchemyJobStore(url='sqlite:///jobs.sqlite')
-}
+# Database setup
+db_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'reminders.sqlite'))
+engine = create_engine(f'sqlite:///{db_path}')
+metadata = MetaData()
 
-executors = {
-    'default': ThreadPoolExecutor(20)
-}
-
-scheduler = BackgroundScheduler(
-    jobstores=jobstores,
-    executors=executors,
-    timezone='UTC'
+# Define reminders table
+reminders = Table(
+    'reminders', metadata,
+    Column('id', String, primary_key=True),
+    Column('reminder_text', String),
+    Column('reminder_time', DateTime),
+    Column('user_id', String),
+    Column('status', String, default='pending')  # pending, completed, or failed
 )
 
-def init_scheduler():
-    """Initialize the scheduler"""
-    if not scheduler.running:
+# Create tables
+metadata.create_all(engine)
+
+def check_reminders():
+    """Background thread to check and trigger reminders"""
+    while True:
         try:
-            scheduler.start()
-            logger.info("Scheduler started successfully")
+            with engine.connect() as conn:
+                # Get all pending reminders that are due
+                now = datetime.now(timezone.utc)
+                query = select(reminders).where(
+                    reminders.c.status == 'pending',
+                    reminders.c.reminder_time <= now
+                )
+
+                result = conn.execute(query)
+                due_reminders = result.fetchall()
+                
+                for reminder in due_reminders:
+                    logger.info(f"REMINDER for user {reminder.user_id}: {reminder.reminder_text}")
+                    # Mark reminder as completed
+                    conn.execute(
+                        reminders.update()
+                        .where(reminders.c.id == reminder.id)
+                        .values(status='completed')
+                    )
+                    conn.commit()
+                    
         except Exception as e:
-            logger.error(f"Error starting scheduler: {e}")
-
-def send_reminder(reminder_text, user_id):
-    """
-    Function that gets called when a reminder is due
-    """
-    logger.info(f"REMINDER for user {user_id}: {reminder_text}")
-
-@app.route('/')
-def home():
-    try:
-        with open(os.getcwd()+'/mysite/index.html', 'r') as file:
-            return file.read()
-    except Exception as e:
-        logger.error(f"Error serving index.html: {e}")
-        return "Error loading page", 500
+            logger.error(f"Error checking reminders: {e}")
+            
+        time.sleep(10)  # Check every 10 seconds
 
 @app.route('/set_reminder', methods=['POST'])
 def set_reminder():
     try:
         data = request.json
         reminder_text = data.get('reminder_text')
-        reminder_time_str = data.get('reminder_time').rstrip('Z')  # Remove trailing Z
+        reminder_time_str = data.get('reminder_time').rstrip('Z')
         reminder_time = datetime.fromisoformat(reminder_time_str)
         user_id = data.get('user_id')
 
         if not all([reminder_text, reminder_time, user_id]):
             return jsonify({'error': 'Missing required fields'}), 400
 
-        job = scheduler.add_job(
-            send_reminder,
-            'date',
-            run_date=reminder_time,
-            args=[reminder_text, user_id],
-            id=f"reminder_{user_id}_{datetime.now().timestamp()}"
-        )
+        reminder_id = f"reminder_{user_id}_{datetime.now().timestamp()}"
+        
+        with engine.connect() as conn:
+            conn.execute(reminders.insert().values(
+                id=reminder_id,
+                reminder_text=reminder_text,
+                reminder_time=reminder_time,
+                user_id=user_id,
+                status='pending'
+            ))
+            conn.commit()
 
         return jsonify({
             'message': 'Reminder set successfully',
-            'job_id': job.id,
+            'reminder_id': reminder_id,
             'reminder_time': reminder_time.isoformat()
         })
 
@@ -90,29 +101,40 @@ def set_reminder():
 
 @app.route('/get_reminders/<user_id>', methods=['GET'])
 def get_reminders(user_id):
-    jobs = scheduler.get_jobs()
-    user_reminders = []
-
-    for job in jobs:
-        if job.args and job.args[1] == user_id:
-            user_reminders.append({
-                'job_id': job.id,
-                'reminder_text': job.args[0],
-                'reminder_time': job.next_run_time.isoformat()
-            })
-
-    return jsonify({'reminders': user_reminders})
-
-@app.route('/delete_reminder/<job_id>', methods=['DELETE'])
-def delete_reminder(job_id):
     try:
-        scheduler.remove_job(job_id)
+        with engine.connect() as conn:
+            query = select(reminders).where(reminders.c.user_id == user_id)
+            result = conn.execute(query)
+            user_reminders = []
+            
+            for row in result:
+                user_reminders.append({
+                    'reminder_id': row.id,
+                    'reminder_text': row.reminder_text,
+                    'reminder_time': row.reminder_time.isoformat(),
+                    'status': row.status
+                })
+
+        return jsonify({'reminders': user_reminders})
+    except Exception as e:
+        logger.error(f"Error getting reminders: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/delete_reminder/<reminder_id>', methods=['DELETE'])
+def delete_reminder(reminder_id):
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                reminders.delete().where(reminders.c.id == reminder_id)
+            )
+            conn.commit()
         return jsonify({'message': 'Reminder deleted successfully'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# Initialize scheduler when the app starts
-init_scheduler()
+# Start the background thread for checking reminders
+reminder_thread = threading.Thread(target=check_reminders, daemon=True)
+reminder_thread.start()
 
 if __name__ == '__main__':
     app.run(debug=True)
